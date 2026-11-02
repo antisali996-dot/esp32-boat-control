@@ -1,0 +1,11 @@
+# Local devices, firmware backups and build dependencies
+/backup/
+/firmware/
+/libraries/
+/tools/
+/work/
+*.exe
+*.bin
+*.elf
+*.map
+*.log
