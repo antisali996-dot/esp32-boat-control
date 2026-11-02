@@ -8,10 +8,11 @@
 #include <Wire.h>
 #include "motor_control.h"
 #include "servo_pulse.h"
+#include "pairing.h"
 
 // Arduino-ESP32 3.x; TS90A 必须使用适配电压，本程序不能防止过压发热。
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, 27, 26);
-const uint8_t REMOTE_MAC[6] = {0x24, 0x62, 0xAB, 0xEF, 0xCF, 0x84};
+uint8_t REMOTE_MAC[6] = {0, 0, 0, 0, 0, 0};
 bool displayOnline = false;
 uint8_t displayAddress = 0;
 uint32_t lastDisplayInit = 0;
@@ -45,12 +46,12 @@ void IRAM_ATTR readEncoder() {
 
 void OnMessageRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   Payload packet;
-  bool valid = info && memcmp(info->src_addr, REMOTE_MAC, 6) == 0 &&
+  bool valid = validPeerMac(REMOTE_MAC) && info && memcmp(info->src_addr, REMOTE_MAC, 6) == 0 &&
                data && len == sizeof(packet);
   if (valid) {
     memcpy(&packet, data, sizeof(packet));
     valid = packet.speedLimit >= 0 && packet.speedLimit <= 100 &&
-            packet.angle >= 60 && packet.angle <= 120;
+            packet.angle >= 70 && packet.angle <= 110;
   }
   const uint32_t now = millis();
   portENTER_CRITICAL(&stateMux);
@@ -108,6 +109,7 @@ void setup() {
   digitalWrite(AIN1, LOW);
   digitalWrite(AIN2, LOW);
   Serial.begin(115200);
+  loadPair(REMOTE_MAC);
   delay(500);
   Serial.println("BOAT DIAGNOSTIC / Arduino-ESP32 3.x");
   Serial.printf("Motor enabled: %s\n", MOTOR_ENABLED ? "YES" : "NO");
@@ -132,7 +134,7 @@ void setup() {
   bool wifiReady = WiFi.mode(WIFI_STA);
   Serial.printf("WiFi STA: %s\n", wifiReady ? "OK" : "FAIL");
   if (wifiReady) {
-    Serial.printf("Boat STA MAC: %s\n", WiFi.macAddress().c_str());
+    pairInfo("BOAT", REMOTE_MAC);
     bool channelOK = checkResult("Set channel", esp_wifi_set_channel(RADIO_CHANNEL, WIFI_SECOND_CHAN_NONE));
     if (channelOK && checkResult("ESP-NOW init", esp_now_init())) {
       radioReady = checkResult("Receive callback", esp_now_register_recv_cb(OnMessageRecv));
@@ -149,6 +151,7 @@ void setup() {
 }
 
 void loop() {
+  servicePairing("BOAT", REMOTE_MAC);
   static uint32_t lastControl = millis(), lastReport = 0, lastDisplay = 0;
   uint32_t count, bad, receivedAt;
   int angle, speed;
@@ -159,7 +162,7 @@ void loop() {
   // 在取得接收快照之后采样，避免新包时间晚于 now 导致无符号下溢。
   const uint32_t now = millis();
   const bool linked = radioReady && count > 0 && uint32_t(now - receivedAt) < LINK_TIMEOUT_MS;
-  const int safeAngle = linked ? constrain(angle, 60, 120) : 90;
+  const int safeAngle = linked ? constrain(angle, 70, 110) : 90;
   const int targetRPM = TARGET_RPM; // 遥控数据仅控制转向，油门字段不参与调速。
   if (servoReady) myservo.writeMicroseconds(steeringPulse(safeAngle));
 

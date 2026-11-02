@@ -9,7 +9,7 @@ static_assert(ADC_MIN < DEAD_LOW && DEAD_LOW < DEAD_HIGH && DEAD_HIGH < ADC_MAX,
 inline int steeringAngle(int raw) {
   if (raw < ADC_MIN) raw = ADC_MIN;
   if (raw > ADC_MAX) raw = ADC_MAX;
-  if (raw < DEAD_LOW) return 60 + (raw - ADC_MIN) * 30 / (DEAD_LOW - ADC_MIN);
-  if (raw > DEAD_HIGH) return 90 + (raw - DEAD_HIGH) * 30 / (ADC_MAX - DEAD_HIGH);
+  if (raw < DEAD_LOW) return 70 + (raw - ADC_MIN) * 20 / (DEAD_LOW - ADC_MIN);
+  if (raw > DEAD_HIGH) return 90 + (raw - DEAD_HIGH) * 20 / (ADC_MAX - DEAD_HIGH);
   return 90;
 }

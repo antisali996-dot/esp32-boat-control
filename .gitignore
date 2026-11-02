@@ -9,3 +9,6 @@
 *.elf
 *.map
 *.log
+
+/release-kit/
+/*.zip

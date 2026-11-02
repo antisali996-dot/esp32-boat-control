@@ -5,9 +5,10 @@
 #include <esp_err.h>
 #include "steering.h"
 #include "tx_state.h"
+#include "pairing.h"
 
 // 目标：已烧录的小船接收板，MAC 经串口读取确认。
-const uint8_t peerAddress[] = {0x24, 0x62, 0xAB, 0xF0, 0x72, 0x94};
+uint8_t peerAddress[] = {0, 0, 0, 0, 0, 0};
 constexpr uint8_t RADIO_CHANNEL = 1;
 constexpr int JOY_STEER = 32, BTN_UP = 25, BTN_DOWN = 26;
 constexpr uint32_t SEND_INTERVAL_MS = 30, SEND_TIMEOUT_MS = 500;
@@ -38,6 +39,7 @@ bool checkResult(const char *step, esp_err_t result) {
 
 void setup() {
   Serial.begin(115200);
+  loadPair(peerAddress);
   pinMode(JOY_STEER, INPUT);
   // 当前小船自动定速 580 RPM：这两个按钮不参与油门控制。
   pinMode(BTN_UP, INPUT_PULLUP);
@@ -49,7 +51,7 @@ void setup() {
     return;
   }
   Serial.printf("Remote STA MAC: %s\n", WiFi.macAddress().c_str());
-  Serial.println("Boat destination: 24:62:AB:F0:72:94");
+  pairInfo("REMOTE", peerAddress);
   if (!checkResult("Set channel", esp_wifi_set_channel(RADIO_CHANNEL, WIFI_SECOND_CHAN_NONE))) return;
   uint8_t channel = 0;
   wifi_second_chan_t secondary;
@@ -58,6 +60,7 @@ void setup() {
   if (channel != RADIO_CHANNEL) return;
   if (!checkResult("ESP-NOW init", esp_now_init())) return;
   if (!checkResult("Send callback", esp_now_register_send_cb(OnDataSent))) return;
+  if (!validPeerMac(peerAddress)) { Serial.println("PAIR REQUIRED / USB configuration needed"); return; }
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, peerAddress, sizeof(peerAddress));
   peerInfo.channel = RADIO_CHANNEL;
@@ -69,6 +72,7 @@ void setup() {
 }
 
 void loop() {
+  servicePairing("REMOTE", peerAddress);
   const uint32_t now = millis();
   static uint32_t lastSample = 0, sum = 0, lastReport = 0;
   static uint8_t samples = 0;
