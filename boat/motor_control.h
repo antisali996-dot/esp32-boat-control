@@ -17,6 +17,9 @@ struct MotorControl {
   int overspeedPwm = 0;
   uint32_t overspeedPulses = 0, overspeedIntervalMs = 0;
 
+  // 故障一旦锁存只有重新上电才清除，本结构不提供任何自动清故障路径。
+  bool overspeedLatched() const { return fault == OVERSPEED; }
+
   // 最近一个控制周期实际采到的脉冲数，供运行日志使用（不参与控制）。
   uint32_t lastPulses = 0;
 

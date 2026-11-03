@@ -13,8 +13,8 @@
 // servo_pulse.h / steering.h / motor_control.h 以 static_assert 把本文件的数值钉死，
 // 任何一边改数值而另一边没改，编译阶段就会失败。
 
-#define FW_SCHEMA 4
-#define FW_VER "20261103-590rpm-r4"
+#define FW_SCHEMA 10
+#define FW_VER "20261103-590rpm-r10"
 
 // 转向：中位 90°，逻辑范围 70～110°（左右各 20°）。
 #define FW_STEER_DEG 20
@@ -34,7 +34,8 @@
 // 惯量、采样延迟与测速误差需要实机数据后由上位机另行确定提前限速裕量。
 #define FW_TARGET_RPM 590
 #define FW_OVERSPEED_RPM 600
-#define FW_CONTROL_REV "pi2-aw-os600"
+// 控制修订号：r6 = MAC 文本完整 + 身份行完整性校验 + 队列完成确认 + 测速临界区对齐。
+#define FW_CONTROL_REV "r10-diagshared"
 
 // 遥控器摇杆死区（沿用原程序数值，等待实测再定）。
 #define FW_JOY_DEAD_LOW 1750

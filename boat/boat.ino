@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <inttypes.h>
 #include <U8g2lib.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -7,9 +8,17 @@
 #include <ESP32Servo.h>
 #include <Wire.h>
 #include "fw_role.h"
+#include "self_mac.h"
+#include "boot_info.h"
 #include "motor_control.h"
 #include "servo_pulse.h"
+#include "speed_window.h"
+#include "pulse_count.h"
+#include "fault_evidence.h"
+#include "diagnostic_commands.h"
 #include "pairing.h"
+#include "run_log.h"
+#include "firmware_port_arduino.h"
 
 // Arduino-ESP32 3.x; TS90A 必须使用适配电压，本程序不能防止过压发热。
 
@@ -39,15 +48,30 @@ static_assert(sizeof(Payload) == 8, "Remote packet must contain two 32-bit integ
 
 // ---- 共享状态 -----------------------------------------------------------
 portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
-volatile uint32_t pulseCount = 0, rxCount = 0, badPackets = 0, lastRxMs = 0;
+volatile uint32_t rxCount = 0, badPackets = 0, lastRxMs = 0;
+// 累计脉冲：与窗口计数在同一临界区内递增，只在构造时为 0。
+PulseCounter pulses;
+// 本次启动的诊断标识（32 个十六进制字符），不写 NVS、不作安全凭据。
+BootId bootId;
+// 首次故障证据（只在首次故障时锁存，之后不覆盖）。
+FaultEvidence evidence;
+DiagHooks diagHooks;
+// 最近一次有效采样快照（RUN 行与 JAY COUNT 用同一来源）。
+PulseSnapshot lastSample;
+bool haveSample = false;
 volatile int requestedAngle = FW_CENTER_ANGLE, requestedSpeed = 0;
 bool radioReady = false, servoReady = false, motorReady = false;
 uint8_t REMOTE_MAC[6] = {0, 0, 0, 0, 0, 0};
+SelfMac selfMac;
+ArduinoFirmwarePort fwPort;
+RunLog runLog;
+PairingState pairing;
 Servo myservo;
 ServoOutput servoOut;
 float actualRPM = 0;
 int currentPwm = 0;
 MotorControl motor;
+uint32_t maxControlGapMs = 0;
 
 // ---- 显示快照 -----------------------------------------------------------
 struct DisplaySnapshot {
@@ -74,8 +98,18 @@ uint8_t displayAddress = 0;
 
 void IRAM_ATTR readEncoder() {
   portENTER_CRITICAL_ISR(&stateMux);
-  pulseCount = pulseCount + 1;
+  // 窗口计数与累计计数由 onEdge() 在同一临界区内一起递增。
+  pulses.onEdge();
   portEXIT_CRITICAL_ISR(&stateMux);
+}
+
+// 读取计量快照：时间、窗口计数、total 必须来自同一个临界区。
+PulseSnapshot snapshotPulses() {
+  portENTER_CRITICAL(&stateMux);
+  const uint32_t now = millis();
+  const PulseSnapshot s = pulses.peek(now);
+  portEXIT_CRITICAL(&stateMux);
+  return s;
 }
 
 void OnMessageRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
@@ -106,7 +140,6 @@ bool checkResult(const char *step, esp_err_t result) {
 }
 
 // ---- 显示任务：Wire / U8g2 只在这里访问 --------------------------------
-// 只探测两种常见 SSD1306 地址；ACK 仅证明设备应答，不证明屏幕像素正常。
 bool displayResponds(uint8_t address) {
   Wire.beginTransmission(address);
   return Wire.endTransmission() == 0;
@@ -130,21 +163,16 @@ void displayTask(void *) {
       }
     }
     if (!displayOnline) {
-      if (wasOnline) {
-        Serial.println("OLED OFFLINE");
-        displayErrorCode = 2;   // 刷新/探测失败，由主循环报告一次；控制不受影响
-      }
+      if (wasOnline) displayErrorCode = 2;   // 由控制循环报告一次；本任务不直接打印
       continue;
     }
 
-    // 即使两次探测之间 OLED 单独复位，也在最多约 10 秒后重发初始化。
     if (!wasOnline || uint32_t(now - lastInit) >= DISPLAY_REINIT_PERIOD_MS) {
       u8g2.setI2CAddress(displayAddress << 1);
       u8g2.initDisplay();
       u8g2.setPowerSave(0);
       u8g2.setFont(u8g2_font_6x12_tr);
       lastInit = now;
-      Serial.printf("OLED INIT address=0x%02X\n", displayAddress);
     }
 
     u8g2.clearBuffer();
@@ -161,7 +189,6 @@ void displayTask(void *) {
       default: u8g2.print("TARGET:"); u8g2.print(snap.targetRpm); break;
     }
     u8g2.sendBuffer();
-    // sendBuffer() 无返回值；用一次总线探测确认本帧确实送达，失败留给下一轮恢复。
     if (!displayResponds(displayAddress)) {
       displayOnline = false;
       displayErrorCode = 2;
@@ -188,6 +215,19 @@ void publishDisplay(const DisplaySnapshot &snap) {
   if (xQueueOverwrite(displayQueue, &snap) != pdTRUE) displayEnabled = false;
 }
 
+
+// ---- 只读诊断命令：薄包装 ----------------------------------------------
+// 格式化、投递与成功判定全部在 diagnostic_commands.h，
+// 这里只负责“取真实快照 / 取锁存证据”，不保留第二套格式串或布尔转换。
+static bool handleCount(RunLog &log) {
+  const PulseSnapshot snap = snapshotPulses();   // 时间与 total 同源
+  return diag::handleCount(log, bootId.hex, snap);
+}
+
+static bool handleFault(RunLog &log) {
+  return diag::handleFault(log, evidence);       // 只读锁存证据，不改它
+}
+
 const char *faultName(MotorControl::Fault f) {
   switch (f) {
     case MotorControl::NO_PULSES: return "NO_ENCODER_PULSES";
@@ -197,21 +237,9 @@ const char *faultName(MotorControl::Fault f) {
   }
 }
 
-const char *resetReasonName(esp_reset_reason_t r) {
-  switch (r) {
-    case ESP_RST_POWERON: return "POWERON";
-    case ESP_RST_EXT: return "EXTERNAL";
-    case ESP_RST_SW: return "SOFTWARE";
-    case ESP_RST_PANIC: return "PANIC";
-    case ESP_RST_INT_WDT: return "INT_WDT";
-    case ESP_RST_TASK_WDT: return "TASK_WDT";
-    case ESP_RST_WDT: return "OTHER_WDT";
-    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
-    case ESP_RST_BROWNOUT: return "BROWNOUT";
-    case ESP_RST_SDIO: return "SDIO";
-    default: return "UNKNOWN";
-  }
-}
+
+// esp_fill_random 的适配：用来生成 boot 标识。
+static void fillRandom16(uint8_t *buf, size_t len) { esp_fill_random(buf, len); }
 
 void setup() {
   // 在任何初始化之前保持动力 PWM 关闭。
@@ -223,13 +251,25 @@ void setup() {
   digitalWrite(AIN2, LOW);
 
   Serial.begin(115200);
-  // 控制路径不等串口：日志出口不阻塞时直接丢弃。启动横幅只输出一次。
+  // 本次启动的诊断标识：16 字节随机 → 32 个十六进制字符。不写 NVS、不作安全凭据。
+  bootId.generate(fillRandom16);
+  // 自身地址先读：不依赖 WiFi 已启动或是否已配对。
+  selfMac.read(readSelfMacRaw);
   loadPair(REMOTE_MAC);
+  fwPort.begin();
+  runLog.begin(&fwPort);
   delay(200);
+
+  char selfText[16];
+  selfMac.state.format(selfText, sizeof(selfText));
+  // 启动一次性横幅：直接输出，不进运行日志队列（setup 里串口不会被控制循环争用）。
   Serial.printf("BOOT FW=%s\n", FW_ID);
   Serial.printf("BOOT VER=%s ROLE=%s MAC=%s RESET=%s(%d)\n", FW_VER, FW_ROLE_LABEL,
-                WiFi.macAddress().c_str(), resetReasonName(esp_reset_reason()),
-                (int)esp_reset_reason());
+                selfText, resetReasonName(esp_reset_reason()), (int)esp_reset_reason());
+  if (!selfMac.ok()) {
+    Serial.printf("BOOT SELF_MAC_READ_FAILED esp=%s\n",
+                  esp_err_to_name((esp_err_t)selfMac.status()));
+  }
   Serial.printf("BOOT TARGET_RPM=%d OVERSPEED_RPM=%d STEER_DEG=%d ANGLE=%d..%d PULSE=%d..%dus\n",
                 TARGET_RPM, OVERSPEED_RPM, FW_STEER_DEG, FW_MIN_ANGLE, FW_MAX_ANGLE,
                 FW_MIN_US, FW_MAX_US);
@@ -252,7 +292,7 @@ void setup() {
 
   bool wifiReady = WiFi.mode(WIFI_STA);
   if (wifiReady) {
-    pairInfo(FW_ROLE_LABEL, REMOTE_MAC);
+    pairInfo(FW_ROLE_LABEL, REMOTE_MAC, selfMac, runLog);
     bool channelOK = checkResult("Set channel", esp_wifi_set_channel(RADIO_CHANNEL, WIFI_SECOND_CHAN_NONE));
     if (channelOK && checkResult("ESP-NOW init", esp_now_init())) {
       radioReady = checkResult("Receive callback", esp_now_register_recv_cb(OnMessageRecv));
@@ -267,10 +307,10 @@ void setup() {
   Serial.printf("Servo attached: %s  Motor PWM: %s\n", servoReady ? "YES" : "NO",
                 motorReady ? "YES" : "NO");
 
-  // 显示在独立任务里启动；失败只禁用显示，控制继续。
-  Wire.begin(26, 27, 100000);
-  Wire.setTimeOut(20);
-  u8g2.setBusClock(100000);
+  // 只读诊断钩子（遥控器不设置，避免伪造编码器数据）。
+  diagHooks.handleCount = handleCount;
+  diagHooks.handleFault = handleFault;
+
   displayEnabled = startDisplayTask();
   if (!displayEnabled) {
     Serial.println("DISPLAY TASK CREATE FAILED / display disabled, control continues");
@@ -281,18 +321,18 @@ void setup() {
 }
 
 void loop() {
-  servicePairing(FW_ROLE_LABEL, REMOTE_MAC);
+  servicePairing(FW_ROLE_LABEL, REMOTE_MAC, selfMac, runLog, fwPort, pairing, diagHooks);
 
-  static uint32_t lastControl = millis(), lastReport = 0, lastDisplayPush = 0;
+  static SpeedWindow speed;
+  static uint32_t lastControl = 0, lastReport = 0, lastDisplayPush = 0;
   static bool controlInitialized = false;
-  static uint32_t maxControlGapMs = 0;
   static int lastLink = -1, lastFault = -1, lastDisplayEnabled = -1;
 
   uint32_t count, bad, receivedAt;
-  int angle, speed;
+  int angle, speedLimit;
   portENTER_CRITICAL(&stateMux);
   count = rxCount; bad = badPackets; receivedAt = lastRxMs;
-  angle = requestedAngle; speed = requestedSpeed;
+  angle = requestedAngle; speedLimit = requestedSpeed;
   portEXIT_CRITICAL(&stateMux);
   // 在取得接收快照之后采样，避免新包时间晚于 now 导致无符号下溢。
   const uint32_t now = millis();
@@ -306,22 +346,59 @@ void loop() {
     if (servoOut.shouldWrite(pulseUs)) myservo.writeMicroseconds(pulseUs);
   }
 
-  // ---- 控制周期：唯一决定动力输出的地方 ----
-  const uint32_t elapsed = now - lastControl;
-  if (!controlInitialized || elapsed >= CONTROL_PERIOD_MS) {
+  // ---- 测速窗口：时间/窗口计数/total 在同一临界区内取同一快照 ----
+  if (!controlInitialized) {
+    uint32_t t0 = 0;
     portENTER_CRITICAL(&stateMux);
-    const uint32_t pulses = pulseCount;
-    pulseCount = 0;
+    t0 = millis();                  // 临界区内重新采样，不用主循环早先的快照
+    // 与测试共用的基准函数：只清 pulses.windowPulses，绝不清 totalPulses。
+    lastSample = beginBaseline(pulses, t0);
+    speed.begin(t0);                // 与清零同一时刻建立的基准
+    haveSample = true;
     portEXIT_CRITICAL(&stateMux);
-    if (controlInitialized && elapsed > maxControlGapMs) maxControlGapMs = elapsed;
-    // 首个周期没有真实间隔，按标称周期计算，避免除零或算出荒谬转速。
-    const uint32_t measured = controlInitialized ? elapsed : CONTROL_PERIOD_MS;
-    actualRPM = pulses * 60000.0f / (PULSES_PER_REV * measured);
-    lastControl = now;
     controlInitialized = true;
-    motor.update(now, measured, pulses, actualRPM, (float)targetRPM, (float)OVERSPEED_RPM,
-                 MOTOR_ENABLED && motorReady && servoReady);
-    currentPwm = motor.pwm;
+
+    // 首轮：不计算 RPM、不出力，因此不可能触发超速。
+    actualRPM = 0.0f;
+    motor.update(t0, CONTROL_PERIOD_MS, 0, 0.0f, (float)targetRPM, (float)OVERSPEED_RPM,
+                 false);        // enabled=false ⇒ pwm 清 0，且不判定超速
+    currentPwm = 0;
+  } else if (speed.ready(now)) {    // 外部只作预检查，真正判定在临界区内
+    uint32_t tSwap = 0, interval = 0;
+    uint32_t windowPulses = 0;
+    uint64_t total = 0;
+    bool windowTaken = false;
+    portENTER_CRITICAL(&stateMux);
+    tSwap = millis();               // 交换时刻重新采样：分母用这个时间
+    interval = speed.elapsed(tSwap);
+    if (interval >= CONTROL_PERIOD_MS) {
+      // 采样时间、窗口计数、累计计数来自同一快照；只清窗口计数。
+      const PulseSnapshot snap = pulses.takeWindow(tSwap, nullptr);
+      windowPulses = snap.windowPulses;
+      total = snap.totalPulses;
+      lastSample = snap;
+      haveSample = true;
+      speed.begin(tSwap);           // 同一时刻建立下一窗口基准
+      windowTaken = true;
+    }
+    portEXIT_CRITICAL(&stateMux);
+
+    // 临界区外才做浮点控制、证据记录与日志。
+    if (windowTaken) {
+      if (interval > maxControlGapMs) maxControlGapMs = interval;
+      actualRPM = SpeedWindow::rpmFromPulses(windowPulses, interval, PULSES_PER_REV);
+      lastControl = tSwap;
+
+      // 在 motor.update 之前构造“本次记录”，pwm/integral 用故障判断之前的值。
+      const MeasureRecord cur = evidence.beginWindow(
+          tSwap, actualRPM, currentPwm, windowPulses, interval, motor.integral);
+      const MotorControl::Fault faultBefore = motor.fault;
+      motor.update(tSwap, interval, windowPulses, actualRPM, (float)targetRPM,
+                   (float)OVERSPEED_RPM, MOTOR_ENABLED && motorReady && servoReady);
+      // 只有首次从 NONE 变成非 NONE 才锁存；证据用故障前的值。
+      evidence.afterUpdate(faultBefore, motor.fault, cur);
+      currentPwm = motor.pwm;
+    }
   }
 
   if (MOTOR_ENABLED && motorReady) {
@@ -334,38 +411,42 @@ void loop() {
   const int linkNow = linked ? 1 : 0;
   if (lastLink != linkNow) {
     lastLink = linkNow;
-    Serial.printf("EVENT LINK=%s count=%lu\n", linked ? "OK" : "LOST", (unsigned long)count);
+    runLog.logLine("EVENT LINK=%s count=%lu", linked ? "OK" : "LOST", (unsigned long)count);
   }
   if (lastFault != (int)motor.fault) {
     lastFault = (int)motor.fault;
     if (motor.fault == MotorControl::OVERSPEED) {
-      // 超速按需求单独记录触发证据，只在锁存瞬间输出一次。
-      Serial.printf("EVENT MOTOR_FAULT=OVERSPEED rpm=%.1f pwm=%d pulses=%lu interval=%lums target=%d threshold=%d\n",
-                    motor.overspeedRpm, motor.overspeedPwm, (unsigned long)motor.overspeedPulses,
-                    (unsigned long)motor.overspeedIntervalMs, targetRPM, OVERSPEED_RPM);
+      // 故障证据同时保存在 motor 的锁存快照里，不只依赖这条可能被丢弃的日志。
+      runLog.logLine("EVENT MOTOR_FAULT=OVERSPEED rpm=%.1f pwm=%d pulses=%lu interval=%lums target=%d threshold=%d",
+              motor.overspeedRpm, motor.overspeedPwm, (unsigned long)motor.overspeedPulses,
+              (unsigned long)motor.overspeedIntervalMs, targetRPM, OVERSPEED_RPM);
     } else {
-      Serial.printf("EVENT MOTOR_FAULT=%s\n", faultName(motor.fault));
+      runLog.logLine("EVENT MOTOR_FAULT=%s", faultName(motor.fault));
     }
   }
   if (lastDisplayEnabled != (displayEnabled ? 1 : 0)) {
     lastDisplayEnabled = displayEnabled ? 1 : 0;
-    if (!displayEnabled) Serial.println("EVENT DISPLAY=DISABLED (control continues)");
+    if (!displayEnabled) runLog.logLine("EVENT DISPLAY=DISABLED (control continues)");
   }
   if (displayErrorCode != 0 && !displayErrorReported) {
     displayErrorReported = true;
-    Serial.printf("EVENT DISPLAY_ERROR=%d (control continues)\n", (int)displayErrorCode);
+    runLog.logLine("EVENT DISPLAY_ERROR=%d (control continues)", (int)displayErrorCode);
   }
 
-  // ---- 周期报告：每秒一次；串口拥塞时只丢弃日志，不阻塞控制 ----
+  // ---- 周期报告：每秒一次；零等待投递 ----
   if (now - lastReport >= REPORT_PERIOD_MS) {
     lastReport = now;
     const uint32_t age = count > 0 ? uint32_t(now - receivedAt) : 0;
-    Serial.printf("RUN up=%lus rpm=%.1f pulses=%lu target=%d pwm=%d integral=%.1f maxgap=%lums\n",
-                  (unsigned long)(now / 1000), actualRPM, (unsigned long)motor.lastPulses,
-                  targetRPM, currentPwm, motor.integral, (unsigned long)maxControlGapMs);
-    Serial.printf("RUN fault=%s rx=%lu bad=%lu lastrx=%lums age=%lums servo=%dus\n",
-                  faultName(motor.fault), (unsigned long)count, (unsigned long)bad,
-                  (unsigned long)receivedAt, (unsigned long)age, steeringPulse(safeAngle));
+    runLog.logLine("RUN up=%lus rpm=%.1f pulses=%lu target=%d pwm=%d integral=%.1f maxgap=%lums dropped=%lu",
+            (unsigned long)(now / 1000), actualRPM, (unsigned long)motor.lastPulses,
+            targetRPM, currentPwm, motor.integral, (unsigned long)maxControlGapMs,
+            (unsigned long)fwPort.droppedNormal());
+    runLog.logLine("RUN fault=%s rx=%lu bad=%lu lastrx=%lums age=%lums servo=%dus speed=%d",
+            faultName(motor.fault), (unsigned long)count, (unsigned long)bad,
+            (unsigned long)receivedAt, (unsigned long)age, steeringPulse(safeAngle), speedLimit);
+    // 采样时间与 total 必须来自同一有效快照；首个有效窗口前用初始基准快照。
+    runLog.logLine("RUN boot=%s sample_ms=%lu total=%" PRIu64,
+                   bootId.hex, (unsigned long)lastSample.sampleMs, lastSample.totalPulses);
   }
 
   // ---- 显示快照：非阻塞覆盖写入 ----
