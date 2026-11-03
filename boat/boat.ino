@@ -21,8 +21,9 @@ constexpr int AIN1 = 16, AIN2 = 18, PWMA = 4;
 constexpr int SERVO_PIN = 25, ENCODER_A = 34;
 constexpr uint8_t RADIO_CHANNEL = 1;
 constexpr uint32_t LINK_TIMEOUT_MS = 1000;
+// 每转脉冲数仍需实测标定，本包不擅自改动。
 constexpr float PULSES_PER_REV = 144.0f;
-constexpr int TARGET_RPM = 580;
+constexpr int TARGET_RPM = FW_TARGET_RPM;
 // 用户要求：上电自动定速，不依赖遥控器油门或是否连接。
 constexpr bool MOTOR_ENABLED = true;
 constexpr uint8_t MOTOR_CHANNEL = 2;
@@ -31,7 +32,7 @@ struct Payload { int32_t speedLimit; int32_t angle; };
 static_assert(sizeof(Payload) == 8, "Remote packet must contain two 32-bit integers");
 portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint32_t pulseCount = 0, rxCount = 0, badPackets = 0, lastRxMs = 0;
-volatile int requestedAngle = 90, requestedSpeed = 0;
+volatile int requestedAngle = FW_CENTER_ANGLE, requestedSpeed = 0;
 bool radioReady = false, servoReady = false, motorReady = false;
 Servo myservo;
 float actualRPM = 0;
@@ -51,7 +52,7 @@ void OnMessageRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len
   if (valid) {
     memcpy(&packet, data, sizeof(packet));
     valid = packet.speedLimit >= 0 && packet.speedLimit <= 100 &&
-            packet.angle >= 70 && packet.angle <= 110;
+            packet.angle >= FW_MIN_ANGLE && packet.angle <= FW_MAX_ANGLE;
   }
   const uint32_t now = millis();
   portENTER_CRITICAL(&stateMux);
@@ -162,7 +163,7 @@ void loop() {
   // 在取得接收快照之后采样，避免新包时间晚于 now 导致无符号下溢。
   const uint32_t now = millis();
   const bool linked = radioReady && count > 0 && uint32_t(now - receivedAt) < LINK_TIMEOUT_MS;
-  const int safeAngle = linked ? constrain(angle, 70, 110) : 90;
+  const int safeAngle = linked ? constrain(angle, FW_MIN_ANGLE, FW_MAX_ANGLE) : FW_CENTER_ANGLE;
   const int targetRPM = TARGET_RPM; // 遥控数据仅控制转向，油门字段不参与调速。
   if (servoReady) myservo.writeMicroseconds(steeringPulse(safeAngle));
 
@@ -204,7 +205,7 @@ void loop() {
     u8g2.setCursor(0, 28); u8g2.print("SIM RPM:"); u8g2.print(displayRPM);
     u8g2.setCursor(0, 44); u8g2.print("ANGLE:"); u8g2.print(safeAngle);
     u8g2.setCursor(0, 60);
-    u8g2.print(motorFault ? "MOTOR FAULT" : "TARGET:580");
+    u8g2.print(motorFault ? "MOTOR FAULT" : ("TARGET:" + String(TARGET_RPM)));
     u8g2.sendBuffer();
   }
   delay(5);

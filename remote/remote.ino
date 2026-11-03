@@ -3,6 +3,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_err.h>
+#include "fw_role.h"
 #include "steering.h"
 #include "tx_state.h"
 #include "pairing.h"
@@ -16,8 +17,7 @@ struct Payload { int32_t speedLimit; int32_t angle; };
 static_assert(sizeof(Payload) == 8, "Boat expects two 32-bit integers");
 
 bool ready = false, sampleReady = false;
-int rawSteer = 2048;
-uint32_t localErrors = 0, lastSendMs = 0;
+int rawSteer = 2048;uint32_t localErrors = 0, lastSendMs = 0;
 esp_err_t lastLocalError = ESP_OK;
 portMUX_TYPE txMux = portMUX_INITIALIZER_UNLOCKED;
 volatile bool txPending = false;
