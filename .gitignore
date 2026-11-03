@@ -12,3 +12,5 @@
 
 /release-kit/
 /*.zip
+# 旧交付包归档：仅本地保留，便于回滚；原 Flash 备份仍在 /backup/
+/archive/

@@ -1,11 +1,27 @@
-﻿param([switch]$LoadOnly)
+﻿param([switch]$LoadOnly, [string]$KitRoot='')
 $ErrorActionPreference='Stop'
-$script:Root=Split-Path -Parent $MyInvocation.MyCommand.Path
+# 默认以脚本所在目录的上一级（套件根）为基准；测试可显式传入。
+if([string]::IsNullOrEmpty($KitRoot)){
+ $script:Root=Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+} else {
+ $script:Root=(Resolve-Path -LiteralPath $KitRoot).Path
+}
 $script:Session=$null
+# 本包固件身份：只有板上 FWID 与之一致才算“已是最新”。
+# 旧 20 度版本虽然也是 STEER=20 / VERSION=2，但没有 FWID 或 FWID 不同，
+# 必须升级，否则会继续按 580 RPM 运行、且没有 600 超速锁存。
+function Get-ExpectedFwid([string]$Role){
+ $manifest=Get-Content -LiteralPath (Join-Path $script:Root '固件\固件清单.json') -Raw | ConvertFrom-Json
+ $key=if($Role -eq 'boat'){'BOAT'}else{'REMOTE'}
+ return $manifest.roles.$key.fwid
+}
 function Assert-Board($Info,[string]$Role,[string]$ExpectedMac='') {
  if(!$Info -or $Info.role -ne $Role){throw '板子用途不符，请检查插入的是小船还是遥控器。'}
  if($ExpectedMac -and $Info.mac -ne $ExpectedMac){throw '芯片地址与本次登记不一致，已停止，没有给这块板写入配对。'}
- if($Info.version -ne '2' -or $Info.steer -ne '20'){throw '板上程序尚不是本版20度程序，请先完成程序升级。'}
+ $want=Get-ExpectedFwid $Role
+ if(!$Info.fwid -or $Info.fwid -ne $want){
+  throw ('板上固件不是本包版本（需要 ' + $want + '，实际 ' + $(if($Info.fwid){$Info.fwid}else{'无 FWID，属旧版'}) + '）。')
+ }
 }
 function Wait-Board([string]$Role){
  $name=if($Role -eq 'boat'){'小船主控'}else{'遥控器'}
@@ -33,15 +49,23 @@ function Open-Serial([string]$Port){
 function Read-SerialInfo($Serial){
  $Serial.DiscardInBuffer();$Serial.WriteLine('JAY INFO')
  $until=[DateTime]::UtcNow.AddSeconds(5)
+ $legacy=$null
  while([DateTime]::UtcNow -lt $until){
   try{
    $line=$Serial.ReadLine()
+   # 优先读新版 JAYv3 身份行（带 FWID）；它才是版本判定依据。
+   if($line -match 'JAYv3 ROLE=(BOAT|REMOTE) MAC=([0-9A-Fa-f:]{17}) PEER=([0-9A-Fa-f:]{17})(?: PAIR=(\d+))?(?: STEER=(-?\d+))?(?: FWID=(\S+))?'){
+    return @{role=$Matches[1].ToLower();mac=$Matches[2].ToUpper();peer=$Matches[3].ToUpper();
+             version=$Matches[4];steer=$Matches[5];fwid=$Matches[6]}
+   }
+   # 旧格式没有 FWID：先记下来，继续等新版身份行，等不到再按“旧版”返回。
    if($line -match 'JAY ROLE=(BOAT|REMOTE) MAC=([0-9A-Fa-f:]{17}) PEER=([0-9A-Fa-f:]{17})(?: VERSION=(\d+))?(?: STEER=(\d+))?'){
-    $version=$Matches[4];$steer=$Matches[5];if(!$version){$version='1'}
-    return @{role=$Matches[1].ToLower();mac=$Matches[2].ToUpper();peer=$Matches[3].ToUpper();version=$version;steer=$steer}
+    $legacy=@{role=$Matches[1].ToLower();mac=$Matches[2].ToUpper();peer=$Matches[3].ToUpper();
+              version=$Matches[4];steer=$Matches[5];fwid=$null}
    }
   }catch [System.TimeoutException]{}
  }
+ if($legacy){return $legacy}
  throw '没有收到板子身份回应。请检查串口或固件。'
 }
 function Read-Board([string]$Port,[switch]$Optional){
@@ -54,8 +78,11 @@ function Prepare-Board([string]$Role){
  $port=Wait-Board $Role
  $info=Read-Board $port -Optional
  if($info -and $info.role -ne $Role){throw '当前插入的板子用途不符。已停止，请换成提示要求的板子。'}
- if(!$info -or $info.version -ne '2' -or $info.steer -ne '20'){
-  Write-Host '这块板需要升级程序，正在识别芯片。'
+ $want=Get-ExpectedFwid $Role
+ $needsUpgrade = (-not $info) -or (-not $info.fwid) -or ($info.fwid -ne $want)
+ if($needsUpgrade){
+  $seen=if($info.fwid){$info.fwid}else{'无 FWID（旧版）'}
+  Write-Host ('这块板需要升级程序（板上：' + $seen + '）。正在识别芯片。')
   $text=Run-Tool -ToolArgs @('--chip','esp32','--port',$port,'--baud','115200','flash_id') -Name ($Role+'-芯片')
   if($text -notmatch '(?m)^MAC:\s*([0-9a-fA-F:]{17})'){throw '无法读取芯片地址，已停止。'}
   $mac=$Matches[1].ToUpper()
