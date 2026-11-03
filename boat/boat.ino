@@ -34,7 +34,9 @@ constexpr uint32_t DISPLAY_REINIT_PERIOD_MS = 10000;
 // 每转脉冲数仍需实测标定，本包不擅自改动。
 constexpr float PULSES_PER_REV = 144.0f;
 constexpr int TARGET_RPM = FW_TARGET_RPM;
-constexpr int OVERSPEED_RPM = FW_OVERSPEED_RPM;
+// 历史阈值：MotorControl::update 保留该参数以兼容签名，但当前不再据此停机。
+// 传 0 即可表达“不参与判断”，避免被误读成“600 保护仍生效”。
+constexpr int OVERSPEED_RPM_HISTORICAL = 0;
 // 用户要求：上电自动定速，不依赖遥控器油门或是否连接。
 constexpr bool MOTOR_ENABLED = true;
 constexpr uint8_t MOTOR_CHANNEL = 2;
@@ -270,10 +272,10 @@ void setup() {
     Serial.printf("BOOT SELF_MAC_READ_FAILED esp=%s\n",
                   esp_err_to_name((esp_err_t)selfMac.status()));
   }
-  Serial.printf("BOOT TARGET_RPM=%d OVERSPEED_RPM=%d STEER_DEG=%d ANGLE=%d..%d PULSE=%d..%dus\n",
-                TARGET_RPM, OVERSPEED_RPM, FW_STEER_DEG, FW_MIN_ANGLE, FW_MAX_ANGLE,
+  // 明确写出超速锁停已关闭，避免被读成“600 保护已启用”。
+  Serial.printf("BOOT TARGET_RPM=%d OVERSPEED_LATCH=OFF STEER_DEG=%d ANGLE=%d..%d PULSE=%d..%dus\n",
+                TARGET_RPM, FW_STEER_DEG, FW_MIN_ANGLE, FW_MAX_ANGLE,
                 FW_MIN_US, FW_MAX_US);
-
   // 舵机库分配在 timer 0；动力用 LEDC 通道 2，映射到 timer 1，二者不同定时器。
   ESP32PWM::allocateTimer(0);
   myservo.setPeriodHertz(50);
@@ -360,7 +362,7 @@ void loop() {
 
     // 首轮：不计算 RPM、不出力，因此不可能触发超速。
     actualRPM = 0.0f;
-    motor.update(t0, CONTROL_PERIOD_MS, 0, 0.0f, (float)targetRPM, (float)OVERSPEED_RPM,
+    motor.update(t0, CONTROL_PERIOD_MS, 0, 0.0f, (float)targetRPM, (float)OVERSPEED_RPM_HISTORICAL,
                  false);        // enabled=false ⇒ pwm 清 0，且不判定超速
     currentPwm = 0;
   } else if (speed.ready(now)) {    // 外部只作预检查，真正判定在临界区内
@@ -394,7 +396,7 @@ void loop() {
           tSwap, actualRPM, currentPwm, windowPulses, interval, motor.integral);
       const MotorControl::Fault faultBefore = motor.fault;
       motor.update(tSwap, interval, windowPulses, actualRPM, (float)targetRPM,
-                   (float)OVERSPEED_RPM, MOTOR_ENABLED && motorReady && servoReady);
+                   (float)OVERSPEED_RPM_HISTORICAL, MOTOR_ENABLED && motorReady && servoReady);
       // 只有首次从 NONE 变成非 NONE 才锁存；证据用故障前的值。
       evidence.afterUpdate(faultBefore, motor.fault, cur);
       currentPwm = motor.pwm;
@@ -417,9 +419,10 @@ void loop() {
     lastFault = (int)motor.fault;
     if (motor.fault == MotorControl::OVERSPEED) {
       // 故障证据同时保存在 motor 的锁存快照里，不只依赖这条可能被丢弃的日志。
-      runLog.logLine("EVENT MOTOR_FAULT=OVERSPEED rpm=%.1f pwm=%d pulses=%lu interval=%lums target=%d threshold=%d",
+      // 历史兼容分支：当前控制路径已不产生 OVERSPEED，只有旧固件残留状态才会走到这里。
+      runLog.logLine("EVENT MOTOR_FAULT=OVERSPEED_HISTORICAL rpm=%.1f pwm=%d pulses=%lu interval=%lums",
               motor.overspeedRpm, motor.overspeedPwm, (unsigned long)motor.overspeedPulses,
-              (unsigned long)motor.overspeedIntervalMs, targetRPM, OVERSPEED_RPM);
+              (unsigned long)motor.overspeedIntervalMs);
     } else {
       runLog.logLine("EVENT MOTOR_FAULT=%s", faultName(motor.fault));
     }

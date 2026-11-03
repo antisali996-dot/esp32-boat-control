@@ -4,6 +4,8 @@
 // 纯逻辑控制器：不依赖 Arduino，便于在电脑上用 g++ 直接回归测试。
 // 故障一旦锁存只有重新上电才清除，本结构不提供任何自动清故障路径。
 struct MotorControl {
+  // OVERSPEED 仅为历史兼容保留：诊断/日志仍能识别旧固件留下的该状态，
+  // 但当前控制路径【不会】再产生它。转速高于目标时由 PI 正常降低输出。
   enum Fault { NONE, NO_PULSES, LOW_SPEED, OVERSPEED };
 
   int pwm = 0;
@@ -12,12 +14,13 @@ struct MotorControl {
   bool trackingSlow = false;
   Fault fault = NONE;
 
-  // 超速触发证据快照：锁存后保留，供串口一次性报告。
+  // 历史超速证据字段：仅用于兼容旧诊断格式，当前控制路径永不写入。
   float overspeedRpm = 0;
   int overspeedPwm = 0;
   uint32_t overspeedPulses = 0, overspeedIntervalMs = 0;
 
   // 故障一旦锁存只有重新上电才清除，本结构不提供任何自动清故障路径。
+  // 历史上表示“超速已锁存”；当前控制不会产生 OVERSPEED，恒为 false。
   bool overspeedLatched() const { return fault == OVERSPEED; }
 
   // 最近一个控制周期实际采到的脉冲数，供运行日志使用（不参与控制）。
@@ -27,21 +30,13 @@ struct MotorControl {
     return v < lo ? lo : (v > hi ? hi : v);
   }
 
-  // targetRpm 为目标转速，overspeedRpm 为软件超速阈值。
+  // targetRpm 为目标转速。overspeedRpmRef 仍保留在签名里以兼容调用方，
+  // 但【不再】用于停机：本版已取消 600 RPM 超速锁存。
+  // 转速高于目标时由下面的 PI 正常降低输出，转速回落后可继续调节。
   void update(uint32_t now, uint32_t elapsed, uint32_t pulses,
               float rpm, float targetRpm, float overspeedRpmRef, bool enabled) {
+    (void)overspeedRpmRef;   // 历史参数：当前控制路径不使用
     lastPulses = pulses;
-    // 超速优先判定：达到阈值立刻切断动力并锁存，不等待下一轮、不因转速回落自动恢复。
-    if (fault == NONE && enabled && elapsed > 0 && rpm >= overspeedRpmRef) {
-      overspeedRpm = rpm;
-      overspeedPwm = pwm;
-      overspeedPulses = pulses;
-      overspeedIntervalMs = elapsed;
-      fault = OVERSPEED;
-      pwm = 0;
-      integral = 0;
-      return;
-    }
 
     if (pulses > 0 || pwm < 80) lastMotion = now;
     if (enabled && pwm >= 80 && uint32_t(now - lastMotion) >= 1500) fault = NO_PULSES;

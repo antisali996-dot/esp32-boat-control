@@ -13,8 +13,8 @@
 // servo_pulse.h / steering.h / motor_control.h 以 static_assert 把本文件的数值钉死，
 // 任何一边改数值而另一边没改，编译阶段就会失败。
 
-#define FW_SCHEMA 10
-#define FW_VER "20261103-590rpm-r10"
+#define FW_SCHEMA 11
+#define FW_VER "20261103-590rpm-r11"
 
 // 转向：中位 90°，逻辑范围 70～110°（左右各 20°）。
 #define FW_STEER_DEG 20
@@ -29,13 +29,14 @@
 #define FW_MIN_US 1278
 #define FW_MAX_US 1722
 
-// 调速：目标 590 RPM，软件超速阈值 600 RPM。
-// 600 是“检测到才断电”的软件阈值，不是物理转速上限的保证；
-// 惯量、采样延迟与测速误差需要实机数据后由上位机另行确定提前限速裕量。
+// 调速：固定 590 RPM 目标。
+// 本版【已取消】600 RPM 超速锁存停机：转速高于目标时由 PI 正常降低输出。
+// 取消锁停不代表保证空载转速低于 600；没有电流反馈，也不能保证带载不过载。
+// FW_OVERSPEED_RPM 仅作为历史数值保留，不参与任何停机判断。
 #define FW_TARGET_RPM 590
 #define FW_OVERSPEED_RPM 600
-// 控制修订号：r6 = MAC 文本完整 + 身份行完整性校验 + 队列完成确认 + 测速临界区对齐。
-#define FW_CONTROL_REV "r10-diagshared"
+// 控制修订号：r11 = 取消 600 超速锁存（OSOFF）。
+#define FW_CONTROL_REV "r11-osoff"
 
 // 遥控器摇杆死区（沿用原程序数值，等待实测再定）。
 #define FW_JOY_DEAD_LOW 1750
@@ -50,9 +51,10 @@
 #define FW_ID_STEER "S" FW_STR(FW_STEER_DEG) "-A" FW_STR(FW_MIN_ANGLE) "-" FW_STR(FW_MAX_ANGLE) \
                    "-U" FW_STR(FW_MIN_US) "-" FW_STR(FW_CENTER_US) "-" FW_STR(FW_MAX_US)
 
-// 小船：转向契约 + 目标转速 + 超速阈值 + 控制修订号。
+// 小船：转向契约 + 目标转速 + 超速锁停状态 + 控制修订号。
+// 使用 -OSOFF 而不是 -OS600，避免与“600 超速锁存已启用”的旧固件混淆。
 #define FW_ID_BOAT "JAYFWB" FW_STR(FW_SCHEMA) "-" FW_ID_STEER \
-                   "-R" FW_STR(FW_TARGET_RPM) "-OS" FW_STR(FW_OVERSPEED_RPM) "-C" FW_CONTROL_REV
+                   "-R" FW_STR(FW_TARGET_RPM) "-OSOFF" "-C" FW_CONTROL_REV
 
 // 遥控器：转向契约 + 摇杆死区。
 #define FW_ID_REMOTE "JAYFWR" FW_STR(FW_SCHEMA) "-" FW_ID_STEER \

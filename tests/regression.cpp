@@ -78,15 +78,16 @@ static void testIdentity() {
   CHECK_EQ(FW_MAX_US, 1722);
   CHECK(FW_OVERSPEED_RPM > FW_TARGET_RPM);
   CHECK(std::strstr(FW_ID_BOAT, "R590") != nullptr);
-  CHECK(std::strstr(FW_ID_BOAT, "OS600") != nullptr);
+  CHECK(std::strstr(FW_ID_BOAT, "OSOFF") != nullptr);
+  CHECK(std::strstr(FW_ID_BOAT, "OS600") == nullptr);
   CHECK(std::strstr(FW_ID_BOAT, "S20-A70-110-U1278-1500-1722") != nullptr);
   CHECK(std::strstr(FW_ID_BOAT, "R580") == nullptr);
   // r10 发布身份必须与上一版不同。
-  CHECK_EQ(FW_SCHEMA, 10);
-  CHECK(std::strstr(FW_VER, "r10") != nullptr);
-  CHECK(std::strstr(FW_ID_BOAT, "r10") != nullptr);
-  CHECK(std::strstr(FW_ID_BOAT, "r9") == nullptr);
-  CHECK(std::strstr(FW_ID_REMOTE, "r9") == nullptr);
+  CHECK_EQ(FW_SCHEMA, 11);
+  CHECK(std::strstr(FW_VER, "r11") != nullptr);
+  CHECK(std::strstr(FW_ID_BOAT, "r11") != nullptr);
+  CHECK(std::strstr(FW_ID_BOAT, "r10") == nullptr);
+  CHECK(std::strstr(FW_ID_REMOTE, "r10") == nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -422,10 +423,13 @@ static void testH_NormalCongestion() {
 
   MotorControl m;
   for (uint32_t t = 50; t <= 3000; t += 50)
-    m.update(t, 50, 70, 585, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+    m.update(t, 50, 40, 400.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
   CHECK_EQ(m.fault, MotorControl::NONE);
+  CHECK(m.pwm > 0);
+  // r11：600 不再锁存；控制照常推进。
   m.update(3050, 50, 74, 600.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
-  CHECK_EQ(m.fault, MotorControl::OVERSPEED);
+  CHECK_EQ(m.fault, MotorControl::NONE);
+  CHECK(m.pwm > 0);
 }
 
 // I. 第二条绑定命令：第一条错误未处理时不能再次写 NVS；INFO/PING 仍可响应。
@@ -670,7 +674,7 @@ static void testFaultEvidenceNoneAndThreeFaults() {
     CHECK(!ev.latched);
   }
 
-  // 超速
+  // r11：600 RPM 不再产生 OVERSPEED，因此不得锁存任何证据。
   {
     FaultEvidence ev;
     MotorControl m;
@@ -681,23 +685,45 @@ static void testFaultEvidenceNoneAndThreeFaults() {
       ev.afterUpdate(before, m.fault, cur);
     }
     CHECK(!ev.latched);
-    const int pwmBefore = m.pwm;
-    const float integBefore = m.integral;
 
     const MeasureRecord cur = ev.beginWindow(2050, 600.0f, m.pwm, 74, 50, m.integral);
     const MotorControl::Fault before = m.fault;
     m.update(2050, 50, 74, 600.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
     ev.afterUpdate(before, m.fault, cur);
+    CHECK(!ev.latched);                       // 关键：不再锁存
+    CHECK_EQ((int)m.fault, (int)MotorControl::NONE);
+  }
 
+  // 仍然存在的保护（无脉冲）必须能锁存，且证据取故障前的 PWM/积分。
+  {
+    FaultEvidence ev;
+    MotorControl m;
+    // 先建立非零输出。
+    for (uint32_t t = 50; t <= 2000; t += 50) {
+      const MeasureRecord cur = ev.beginWindow(t, 585, m.pwm, 70, 50, m.integral);
+      const MotorControl::Fault before = m.fault;
+      m.update(t, 50, 70, 585, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+      ev.afterUpdate(before, m.fault, cur);
+    }
+    CHECK(!ev.latched);
+    CHECK(m.pwm > 0);
+    const int pwmBefore = m.pwm;
+    const float integBefore = m.integral;
+
+    // 之后持续无脉冲，直到 NO_PULSES 锁存。
+    for (uint32_t t = 2050; t <= 5000 && !ev.latched; t += 50) {
+      const MeasureRecord cur = ev.beginWindow(t, 0.0f, m.pwm, 0, 50, m.integral);
+      const MotorControl::Fault before = m.fault;
+      m.update(t, 50, 0, 0.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+      ev.afterUpdate(before, m.fault, cur);
+    }
     CHECK(ev.latched);
-    CHECK_EQ((int)ev.fault, (int)MotorControl::OVERSPEED);
+    CHECK_EQ((int)ev.fault, (int)MotorControl::NO_PULSES);
     CHECK_EQ(ev.id, 1u);
-    CHECK_EQ(ev.current.ms, 2050u);
-    CHECK_EQ(ev.current.pwm, pwmBefore);      // 故障前 PWM
-    CHECK_EQ(ev.current.integral, integBefore);
-    CHECK_EQ(ev.current.pulses, 74u);
-    CHECK(ev.hasPrevious);                    // 有上一窗口
-    CHECK_EQ(ev.previous.ms, 2000u);
+    // 证据里保存的是故障前一刻（仍有输出时）的 PWM。
+    CHECK(ev.current.pwm > 0);
+    CHECK(ev.hasPrevious);
+    (void)pwmBefore; (void)integBefore;
   }
 
   // 无脉冲（第一窗口就故障 → PREVIOUS 全 0）
@@ -737,13 +763,23 @@ static void testFaultEvidenceNoneAndThreeFaults() {
 static void testFaultEvidenceFirstWindowZeroPrev() {
   FaultEvidence ev;
   MotorControl m;
-  // 直接构造一个第一窗口即超速的场景。
-  const MeasureRecord cur = ev.beginWindow(1050, 650.0f, 42, 80, 50, 12.5f);
-  const MotorControl::Fault before = m.fault;   // NONE
-  m.update(1050, 50, 80, 650.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
-  ev.afterUpdate(before, m.fault, cur);
+  // r11：600 不再锁存，改用仍然存在的“持续无脉冲”保护。
+  // 要求锁存发生在【第一个】窗口：先让控制器建立起 >=80 的输出，
+  // 然后用一个跨越 1500ms 的窗口在首帧内触发 NO_PULSES。
+  // 先用几个正常窗口把输出抬到 >=80（启动斜率每周期最多 +10）。
+  for (uint32_t t = 1000; t < 1600; t += 50) {
+    m.update(t, 50, 70, 300.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+    CHECK_EQ(m.fault, MotorControl::NONE);
+  }
+  CHECK(m.pwm >= 80);
 
+  // 第 1 个有效窗口（就 ev 而言）：输出>=80 且已 1500ms 无脉冲 → 本窗口即锁存。
+  const MeasureRecord cur = ev.beginWindow(3150, 0.0f, m.pwm, 0, 1550, m.integral);
+  const MotorControl::Fault before = m.fault;
+  m.update(3150, 1550, 0, 0.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+  ev.afterUpdate(before, m.fault, cur);
   CHECK(ev.latched);
+  CHECK_EQ((int)ev.fault, (int)MotorControl::NO_PULSES);
   CHECK(!ev.hasPrevious);                    // 没有上一有效窗口
   CHECK_EQ(ev.previous.ms, 0u);
   CHECK_EQ((int)ev.previous.rpm, 0);
@@ -756,36 +792,47 @@ static void testFaultEvidenceFirstWindowZeroPrev() {
 static void testFaultEvidenceNotOverwritten() {
   FaultEvidence ev;
   MotorControl m;
+  // 先建立输出，再进入持续无脉冲 → NO_PULSES 锁存。
   for (uint32_t t = 50; t <= 2000; t += 50) {
     const MeasureRecord c = ev.beginWindow(t, 585, m.pwm, 70, 50, m.integral);
     const MotorControl::Fault b = m.fault;
     m.update(t, 50, 70, 585, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
     ev.afterUpdate(b, m.fault, c);
   }
-  for (uint32_t t = 2050; t <= 6000; t += 50) {
-    const MeasureRecord c = ev.beginWindow(t, 610.0f, m.pwm, 80, 50, m.integral);
+  uint32_t latchedAt = 0;
+  for (uint32_t t = 2050; t <= 5000 && !ev.latched; t += 50) {
+    const MeasureRecord c = ev.beginWindow(t, 0.0f, m.pwm, 0, 50, m.integral);
     const MotorControl::Fault b = m.fault;
-    m.update(t, 50, 80, 610.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+    m.update(t, 50, 0, 0.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
     ev.afterUpdate(b, m.fault, c);
+    latchedAt = t;
   }
   CHECK(ev.latched);
+  const uint32_t lockedMs = ev.current.ms;
+  CHECK_EQ(lockedMs, latchedAt);
+
+  // 故障后继续运行（含高于 600 的转速）：证据不得被覆盖。
+  for (uint32_t t = 5050; t <= 8000; t += 50) {
+    const MeasureRecord c = ev.beginWindow(t, 680.0f, m.pwm, 80, 50, m.integral);
+    const MotorControl::Fault b = m.fault;
+    m.update(t, 50, 80, 680.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+    ev.afterUpdate(b, m.fault, c);
+  }
   CHECK_EQ(ev.id, 1u);                       // 只有一次锁存
-  CHECK_EQ(ev.current.ms, 2050u);            // 首次故障的那一窗口，未被子序列覆盖
+  CHECK_EQ(ev.current.ms, lockedMs);         // 未被子序列覆盖
+  CHECK_EQ((int)ev.fault, (int)MotorControl::NO_PULSES);
 }
 
 static void testFaultFormatting() {
   FaultEvidence ev;
   MotorControl m;
-  for (uint32_t t = 50; t <= 2000; t += 50) {
-    const MeasureRecord c = ev.beginWindow(t, 585.0f, m.pwm, 70, 50, m.integral);
+  // r11：用仍然存在的“持续无脉冲”保护构造锁存证据。
+  for (uint32_t t = 50; t <= 4000; t += 50) {
+    const MeasureRecord c = ev.beginWindow(t, 0.0f, m.pwm, 0, 50, m.integral);
     const MotorControl::Fault b = m.fault;
-    m.update(t, 50, 70, 585, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+    m.update(t, 50, 0, 0.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
     ev.afterUpdate(b, m.fault, c);
   }
-  const MeasureRecord cur = ev.beginWindow(2050, 612.4f, 141, 74, 50, 88.44f);
-  const MotorControl::Fault b = m.fault;
-  m.update(2050, 50, 74, 612.4f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
-  ev.afterUpdate(b, m.fault, cur);
   CHECK(ev.latched);
 
   char curLine[IDENTITY_LINE_CAP];
@@ -795,8 +842,10 @@ static void testFaultFormatting() {
 
   const std::string c(curLine), p(prevLine);
   // 字段名称与顺序固定。
-  CHECK(c.find("JAY FAULT CURRENT id=1 name=OVERSPEED ms=2050 rpm=612.40 pwm=141 pulses=74 elapsed=50 integral=88.44") == 0);
-  CHECK(p.find("JAY FAULT PREVIOUS id=1 ms=2000 rpm=") == 0);
+  CHECK(c.find("JAY FAULT CURRENT id=1 name=NO_ENCODER_PULSES") == 0);
+  CHECK(c.find(" rpm=0.00 ") != std::string::npos);
+  CHECK(c.find(" pulses=0 ") != std::string::npos);
+  CHECK(p.find("JAY FAULT PREVIOUS id=1 ") == 0);
   // 两行 id 一致。
   CHECK(c.find("id=1 ") != std::string::npos);
   CHECK(p.find("id=1 ") != std::string::npos);
@@ -843,23 +892,19 @@ static void testFaultCommandAfterLatch() {
   FaultRig r;
   g_faultRig = &r;
   MotorControl m;
-  for (uint32_t t = 50; t <= 2000; t += 50) {
-    const MeasureRecord c = r.ev.beginWindow(t, 585, m.pwm, 70, 50, m.integral);
+  for (uint32_t t = 50; t <= 4000; t += 50) {
+    const MeasureRecord c = r.ev.beginWindow(t, 0.0f, m.pwm, 0, 50, m.integral);
     const MotorControl::Fault b = m.fault;
-    m.update(t, 50, 70, 585, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+    m.update(t, 50, 0, 0.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
     r.ev.afterUpdate(b, m.fault, c);
   }
-  const MeasureRecord c = r.ev.beginWindow(2050, 610.0f, m.pwm, 74, 50, m.integral);
-  const MotorControl::Fault b = m.fault;
-  m.update(2050, 50, 74, 610.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
-  r.ev.afterUpdate(b, m.fault, c);
   CHECK(r.ev.latched);
 
   r.port.feed("JAY FAULT");
   servicePairing("BOAT", r.peer, r.self, r.log, r.port, r.st, r.hooks);
   r.port.runQueue();
   CHECK_EQ((int)r.port.written.size(), 2);
-  CHECK(r.port.written[0].find("JAY FAULT CURRENT id=1 name=OVERSPEED") == 0);
+  CHECK(r.port.written[0].find("JAY FAULT CURRENT id=1 name=NO_ENCODER_PULSES") == 0);
   CHECK(r.port.written[1].find("JAY FAULT PREVIOUS id=1") == 0);
 
   // 查询不清除故障。
@@ -879,9 +924,13 @@ static void testFaultCommandQueueFull() {
   FaultRig r;
   g_faultRig = &r;
   MotorControl m;
-  const MeasureRecord c = r.ev.beginWindow(1050, 650.0f, 42, 80, 50, 12.5f);
+  // r11：用仍然存在的“持续无脉冲”保护构造证据。
+  for (uint32_t t = 1000; t < 1600; t += 50)
+    m.update(t, 50, 70, 300.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+  CHECK(m.pwm >= 80);
+  const MeasureRecord c = r.ev.beginWindow(3150, 0.0f, m.pwm, 0, 1550, m.integral);
   const MotorControl::Fault b = m.fault;
-  m.update(1050, 50, 80, 650.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+  m.update(3150, 1550, 0, 0.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
   r.ev.afterUpdate(b, m.fault, c);
   CHECK(r.ev.latched);
 
@@ -1103,19 +1152,17 @@ static void testFaultNoneSharedImpl() {
 }
 
 // 构造一个已锁存的证据（超速，带上一窗口）。
+// r11：600 不再触发锁存，因此故障证据用一个仍然存在的保护来构造：
+// 高输出且持续无脉冲 → NO_ENCODER_PULSES 锁存。
 static FaultEvidence makeLatchedEvidence() {
   FaultEvidence ev;
   MotorControl m;
-  for (uint32_t t = 50; t <= 2000; t += 50) {
-    const MeasureRecord c = ev.beginWindow(t, 585.0f, m.pwm, 70, 50, m.integral);
+  for (uint32_t t = 50; t <= 4000; t += 50) {
+    const MeasureRecord c = ev.beginWindow(t, 0.0f, m.pwm, 0, 50, m.integral);
     const MotorControl::Fault b = m.fault;
-    m.update(t, 50, 70, 585, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+    m.update(t, 50, 0, 0.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
     ev.afterUpdate(b, m.fault, c);
   }
-  const MeasureRecord c = ev.beginWindow(2050, 612.4f, m.pwm, 74, 50, m.integral);
-  const MotorControl::Fault b = m.fault;
-  m.update(2050, 50, 74, 612.4f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
-  ev.afterUpdate(b, m.fault, c);
   return ev;
 }
 
@@ -1129,7 +1176,7 @@ static void testFaultBothLinesSharedImpl() {
   CHECK_EQ((int)port.criticalQ.size(), 2);
   const std::string a = port.criticalQ[0].second;
   const std::string b = port.criticalQ[1].second;
-  CHECK(a.find("JAY FAULT CURRENT id=1 name=OVERSPEED") == 0);
+  CHECK(a.find("JAY FAULT CURRENT id=1 name=NO_ENCODER_PULSES") == 0);
   CHECK(b.find("JAY FAULT PREVIOUS id=1") == 0);
 }
 
@@ -1432,39 +1479,127 @@ static void testMotorTarget() {
   CHECK(m.pwm < 255);
 }
 
-static void testOverspeedLatch() {
-  MotorControl m;
-  runMotor(m, 50, 2000, 50, 70, 585);
-  CHECK_EQ(m.fault, MotorControl::NONE);
-  const int pwmBefore = m.pwm;
-  m.update(2050, 50, 74, 600.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
-  CHECK_EQ(m.fault, MotorControl::OVERSPEED);
-  CHECK_EQ(m.pwm, 0);
-  CHECK(m.overspeedRpm >= 600.0f);
-  CHECK_EQ(m.overspeedPwm, pwmBefore);
-  CHECK_EQ(m.overspeedIntervalMs, 50u);
-  CHECK_EQ(m.overspeedPulses, 74u);
+// ---------------------------------------------------------------------------
+// 第1轮（r11）：取消 600 超速锁存后的控制行为
+//
+// 生产代码已删除“rpm >= 600 → OVERSPEED 锁存 → PWM 清零”分支。
+// 下面直接驱动真实 MotorControl，验证高转速由 PI 正常处理。
+// ---------------------------------------------------------------------------
 
-  m.update(2100, 50, 72, 590.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
-  CHECK_EQ(m.pwm, 0);
-  m.update(2150, 50, 0, 0.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
-  CHECK_EQ(m.pwm, 0);
-  runMotor(m, 2200, 6000, 50, 70, 589);
-  CHECK_EQ(m.pwm, 0);
-  CHECK_EQ(m.fault, MotorControl::OVERSPEED);
+// 1-2. 599/600/601/650/680 均不得产生 OVERSPEED；高于目标时 PI 降低输出。
+static void testNoOverspeedLatchAtAnyRpm() {
+  const float rmps[] = {599.0f, 600.0f, 601.0f, 650.0f, 680.0f};
+  for (float r : rmps) {
+    MotorControl m;
+    // 用低于目标的转速建立较大的稳定输出（避免稳态误差太小导致 PWM 接近 0）。
+    runMotor(m, 50, 2000, 50, 40, 400);
+    CHECK_EQ(m.fault, MotorControl::NONE);
+    const int pwmBefore = m.pwm;
+    CHECK(pwmBefore > 0);
+
+    // 单个窗口冲到该转速：不得锁存，PWM 不得被清零。
+    m.update(2050, 50, 74, r, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+    CHECK_EQ(m.fault, MotorControl::NONE);
+    CHECK(!m.overspeedLatched());
+    CHECK(m.pwm > 0);
+    // 高于目标 → PI 输出必须下降（不是被清零，也不是继续加大）。
+    CHECK(m.pwm < pwmBefore);
+
+    // 持续保持该高转速多个窗口：仍然不得锁存。
+    // 注意：PI 可能把输出压到 0（转速远高于目标时的正常调节），
+    // 这与“故障锁停”不同——判据是 fault 仍为 NONE 且之后还能重新出力。
+    for (uint32_t t = 2100; t <= 6000; t += 50) {
+      m.update(t, 50, 74, r, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+      CHECK_EQ(m.fault, MotorControl::NONE);
+    }
+    CHECK(!m.overspeedLatched());
+
+    // 转速回落到远低于目标：必须能重新建立输出（证明不是永久停机）。
+    for (uint32_t t = 6050; t <= 8000; t += 50)
+      m.update(t, 50, 40, 300.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+    CHECK_EQ(m.fault, MotorControl::NONE);
+    CHECK(m.pwm > 0);
+  }
 }
 
-static void testOverspeedBoundary() {
-  MotorControl a;
-  runMotor(a, 50, 3000, 50, 70, 589);
-  a.update(3050, 50, 72, 599.9f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
-  CHECK_EQ(a.fault, MotorControl::NONE);
+// 3. 超过 600 后回到 590 以下，控制器仍能继续调节。
+static void testRecoversAfterHighRpm() {
+  MotorControl m;
+  runMotor(m, 50, 2000, 50, 40, 400);      // 建立较大输出
+  CHECK_EQ(m.fault, MotorControl::NONE);
 
+  // 冲到 680 若干个窗口。
+  for (uint32_t t = 2050; t <= 3000; t += 50)
+    m.update(t, 50, 80, 680.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+  CHECK_EQ(m.fault, MotorControl::NONE);
+  const int pwmHigh = m.pwm;
+
+  // 回落到 500（低于目标）：输出应重新上升，说明没有永久停机。
+  for (uint32_t t = 3050; t <= 5000; t += 50)
+    m.update(t, 50, 60, 500.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+  CHECK_EQ(m.fault, MotorControl::NONE);
+  CHECK(m.pwm > pwmHigh);      // 再次加油
+  CHECK(m.pwm > 0);
+}
+
+// 4. 无脉冲保护仍能触发并锁存。
+static void testNoPulsesStillLatches() {
+  MotorControl m;
+  runMotor(m, 50, 4000, 50, 0, 0);          // 高输出且无脉冲
+  CHECK_EQ(m.fault, MotorControl::NO_PULSES);
+  CHECK_EQ(m.pwm, 0);
+  // 锁存后即使转速恢复也不得自动重启。
+  runMotor(m, 4050, 7000, 50, 70, 590);
+  CHECK_EQ(m.fault, MotorControl::NO_PULSES);
+  CHECK_EQ(m.pwm, 0);
+}
+
+// 5. 持续严重低速保护仍能触发并锁存。
+static void testLowSpeedStillLatches() {
+  MotorControl m;
+  runMotor(m, 50, 10000, 50, 12, 100);      // 高输出、持续严重掉速
+  CHECK_EQ(m.fault, MotorControl::LOW_SPEED);
+  CHECK_EQ(m.pwm, 0);
+  runMotor(m, 10050, 14000, 50, 70, 590);
+  CHECK_EQ(m.fault, MotorControl::LOW_SPEED);
+  CHECK_EQ(m.pwm, 0);
+}
+
+// 6. 已锁存的其他故障不得因本次改动被自动清除（即使转速超过 600）。
+static void testLatchedFaultsNotClearedByOverspeedPathRemoval() {
+  // 无脉冲锁存后，输入 680 RPM 也不得清除故障或恢复输出。
+  MotorControl a;
+  runMotor(a, 50, 4000, 50, 0, 0);
+  CHECK_EQ(a.fault, MotorControl::NO_PULSES);
+  runMotor(a, 4050, 8000, 50, 80, 680.0f);
+  CHECK_EQ(a.fault, MotorControl::NO_PULSES);
+  CHECK_EQ(a.pwm, 0);
+
+  // 低速锁存后同样不得清除。
   MotorControl b;
-  runMotor(b, 50, 3000, 50, 70, 589);
-  b.update(3050, 50, 72, 600.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
-  CHECK_EQ(b.fault, MotorControl::OVERSPEED);
+  runMotor(b, 50, 10000, 50, 12, 100);
+  CHECK_EQ(b.fault, MotorControl::LOW_SPEED);
+  runMotor(b, 10050, 14000, 50, 80, 680.0f);
+  CHECK_EQ(b.fault, MotorControl::LOW_SPEED);
   CHECK_EQ(b.pwm, 0);
+}
+
+// PI 在高转速下继续按误差调节（不依赖故障路径）。
+static void testPiStillRegulatesAboveTarget() {
+  MotorControl m;
+  runMotor(m, 50, 2000, 50, 40, 400);      // 建立较大输出
+  const int atTarget = m.pwm;
+  CHECK(atTarget > 0);
+
+  // 略高于目标：输出应减小。
+  m.update(2050, 50, 74, 620.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+  CHECK(m.pwm < atTarget);
+  const int at620 = m.pwm;
+
+  // 更高：继续减小（或至少不再增加）。
+  m.update(2100, 50, 80, 700.0f, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+  CHECK(m.pwm <= at620);
+  CHECK_EQ(m.fault, MotorControl::NONE);
 }
 
 static void testExistingProtections() {
@@ -1640,8 +1775,12 @@ int main() {
   testI_SecondBindBlocked();
   testStateEventOnce();
   testMotorTarget();
-  testOverspeedLatch();
-  testOverspeedBoundary();
+  testNoOverspeedLatchAtAnyRpm();
+  testRecoversAfterHighRpm();
+  testNoPulsesStillLatches();
+  testLowSpeedStillLatches();
+  testLatchedFaultsNotClearedByOverspeedPathRemoval();
+  testPiStillRegulatesAboveTarget();
   testExistingProtections();
   testRampAndWindup();
   testServo();
