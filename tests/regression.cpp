@@ -7,7 +7,7 @@
 //   boat/identity_line.h   身份行格式化（固件 postIdentity 与测试共用同一实现）
 //   boat/self_mac_logic.h  自身 MAC 判定
 //   boat/speed_window.h    测速窗口与临界区交换
-//   boat/motor_control.h   590 目标 / 600 超速锁存
+//   boat/motor_control.h   540 目标(r12) / 600 锁存已取消(OSOFF)
 //   boat/servo_pulse.h     舵机脉宽与 14 位量化
 //   remote/tx_callback.h   发送回调适配层
 //   remote/tx_state.h      发送状态机
@@ -68,7 +68,7 @@ constexpr float PULSES_PER_REV = 144.0f;
 // 身份常量
 // ---------------------------------------------------------------------------
 static void testIdentity() {
-  CHECK_EQ(FW_TARGET_RPM, 590);
+  CHECK_EQ(FW_TARGET_RPM, 540);   // r12：目标临时降为 540
   CHECK_EQ(FW_OVERSPEED_RPM, 600);
   CHECK_EQ(FW_CENTER_ANGLE, 90);
   CHECK_EQ(FW_MIN_ANGLE, 70);
@@ -77,17 +77,18 @@ static void testIdentity() {
   CHECK_EQ(FW_MIN_US, 1278);
   CHECK_EQ(FW_MAX_US, 1722);
   CHECK(FW_OVERSPEED_RPM > FW_TARGET_RPM);
-  CHECK(std::strstr(FW_ID_BOAT, "R590") != nullptr);
+  CHECK(std::strstr(FW_ID_BOAT, "R540") != nullptr);
+  CHECK(std::strstr(FW_ID_BOAT, "R590") == nullptr);
   CHECK(std::strstr(FW_ID_BOAT, "OSOFF") != nullptr);
   CHECK(std::strstr(FW_ID_BOAT, "OS600") == nullptr);
   CHECK(std::strstr(FW_ID_BOAT, "S20-A70-110-U1278-1500-1722") != nullptr);
   CHECK(std::strstr(FW_ID_BOAT, "R580") == nullptr);
   // r10 发布身份必须与上一版不同。
-  CHECK_EQ(FW_SCHEMA, 11);
-  CHECK(std::strstr(FW_VER, "r11") != nullptr);
-  CHECK(std::strstr(FW_ID_BOAT, "r11") != nullptr);
-  CHECK(std::strstr(FW_ID_BOAT, "r10") == nullptr);
-  CHECK(std::strstr(FW_ID_REMOTE, "r10") == nullptr);
+  CHECK_EQ(FW_SCHEMA, 13);
+  CHECK(std::strstr(FW_VER, "r13") != nullptr);
+  CHECK(std::strstr(FW_ID_BOAT, "r13") != nullptr);
+  CHECK(std::strstr(FW_ID_BOAT, "r12") == nullptr);
+  CHECK(std::strstr(FW_ID_REMOTE, "r12") == nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -698,11 +699,11 @@ static void testFaultEvidenceNoneAndThreeFaults() {
   {
     FaultEvidence ev;
     MotorControl m;
-    // 先建立非零输出。
+    // 先建立非零输出（激励须低于目标 540，否则稳态输出会收敛到 0）。
     for (uint32_t t = 50; t <= 2000; t += 50) {
-      const MeasureRecord cur = ev.beginWindow(t, 585, m.pwm, 70, 50, m.integral);
+      const MeasureRecord cur = ev.beginWindow(t, 400, m.pwm, 70, 50, m.integral);
       const MotorControl::Fault before = m.fault;
-      m.update(t, 50, 70, 585, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+      m.update(t, 50, 70, 400, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
       ev.afterUpdate(before, m.fault, cur);
     }
     CHECK(!ev.latched);
@@ -1471,12 +1472,116 @@ static void runMotor(MotorControl &m, uint32_t fromMs, uint32_t toMs, uint32_t s
 }
 
 static void testMotorTarget() {
+  // r12：420 低于目标 540，但高于严重低速阈值 351（540*0.65），可用于验证正常调节。
   MotorControl m;
   runMotor(m, 50, 4000, 50, 60, 420);
   CHECK_EQ(m.fault, MotorControl::NONE);
   CHECK_EQ(m.pwm, 255);
   m.update(4050, 50, 120, 1000, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
   CHECK(m.pwm < 255);
+}
+
+// r12：低速保护阈值必须跟随新目标 540（540*0.65=351），不得写死旧 590 对应的 383.5。
+// 360 高于新阈值 351、低于旧目标 590 对应的 383.5；且只有在 PWM>=220 并持续 2000ms
+// 的条件同时满足时才会锁存严重低速——阈值不同时本测试的结局必然不同。
+static void testLowSpeedThresholdFollowsTarget() {
+  // rpm=360：高于新阈值 351 → 不判低速；低于旧阈值 383.5 → 写死旧值时会被判低速。
+  MotorControl a;
+  runMotor(a, 50, 5000, 50, 60, 360);   // r13：终点由 3000ms 延长到 5000ms
+  CHECK_EQ(a.fault, MotorControl::NONE);      // 360 高于 351，不锁存
+  CHECK(a.pwm > 0);
+
+  // rpm=340：低于 351，且 PWM>=220 持续 2000ms → 必须锁存 LOW_SPEED。
+  MotorControl b;
+  runMotor(b, 50, 10000, 50, 60, 340);
+  CHECK_EQ(b.fault, MotorControl::LOW_SPEED);
+  CHECK_EQ(b.pwm, 0);
+}
+
+// ---------------------------------------------------------------------------
+// r13：小数积分保留（修复“整数 PWM 反压吞掉小数积分”缺陷）
+//
+// 共同初值：target=540、elapsed=50ms、pwm=50、
+//           integral = 50 - 0.18 × (540 - feedbackRpm)
+//           （即 proportional + integral = 50，恰好等于初始 PWM）
+// 每个窗口都给非零脉冲，避免触发无脉冲保护。
+// 连续 200 个周期（10 秒），直接驱动生产 MotorControl。
+// ---------------------------------------------------------------------------
+
+// 构造共同初值并推进一个周期；返回是否已建立初值条件。
+static void r13InitCase(MotorControl &m, float feedbackRpm) {
+  const float integral0 = 50.0f - 0.18f * (540.0f - feedbackRpm);
+  m.pwm = 50;
+  m.integral = integral0;
+  // 首个窗口按给定反馈运行（elapsed=50ms，非零脉冲）。
+  m.update(50, 50, 60, feedbackRpm, 540.0f, 600.0f, true);
+}
+
+// 正式要求：持续正误差、未触及输出约束时，
+// 积分能够跨周期积累，PWM 最终高于初值。
+static void testPiFractionAccumulates() {
+  const float cases[] = {530.0f, 520.0f};
+  for (float fb : cases) {
+    MotorControl m;
+    r13InitCase(m, fb);
+    const int pwmStart = 50;
+    bool exceeded = false;
+    for (uint32_t t = 100; t <= 10000; t += 50) {
+      m.update(t, 50, 60, fb, 540.0f, 600.0f, true);
+      CHECK_EQ(m.fault, MotorControl::NONE);
+      CHECK(m.pwm >= 0 && m.pwm <= 255);
+      // 输出必须单调不降（正误差、未触斜率上限时允许 +10/周期）。
+      if (m.pwm > pwmStart) exceeded = true;
+    }
+    CHECK(exceeded);                 // 10 秒内输出必须高于初值
+    CHECK(m.pwm > pwmStart);
+    CHECK(m.integral > 50.0f - 0.18f * (540.0f - fb));  // 积分有有效增长
+  }
+  // 斜率约束仍生效：每周期上升不超过 10。
+  {
+    MotorControl m;
+    r13InitCase(m, 520.0f);
+    int prev = m.pwm;
+    for (uint32_t t = 100; t <= 2000; t += 50) {
+      m.update(t, 50, 60, 520.0f, 540.0f, 600.0f, true);
+      CHECK(m.pwm - prev <= 10);
+      prev = m.pwm;
+    }
+  }
+}
+
+// 误差为 0：不得产生无理由的积分增长。
+static void testPiFractionZeroErrorStable() {
+  MotorControl m;
+  // 先让系统在目标处稳定（proportional=0，integral 承担全部输出）。
+  m.pwm = 50;
+  m.integral = 50.0f;
+  m.update(50, 50, 60, 540.0f, 540.0f, 600.0f, true);
+  const float i0 = m.integral;
+  for (uint32_t t = 100; t <= 5000; t += 50) {
+    m.update(t, 50, 60, 540.0f, 540.0f, 600.0f, true);
+    CHECK_EQ(m.fault, MotorControl::NONE);
+    // 误差为 0：积分不应增长（允许被抗饱和/取整路径向下修正，但不得上扬）。
+    CHECK(m.integral <= i0 + 0.001f);
+    CHECK(m.pwm <= 255);
+  }
+}
+
+// 反馈高于目标：PWM 能够降低；饱和后回落不得被积分钉在 255。
+static void testPiFractionUnloading() {
+  // 建立饱和输出。
+  MotorControl m;
+  runMotor(m, 50, 4000, 50, 60, 420);
+  CHECK_EQ(m.pwm, 255);
+  // 反馈升到目标以上，输出必须下降。
+  for (uint32_t t = 4050; t <= 8000; t += 50)
+    m.update(t, 50, 120, 700.0f, 540.0f, 600.0f, true);
+  CHECK(m.pwm < 255);
+  // 长期高于目标：不得因积分堆积而一直保持 255。
+  for (uint32_t t = 8050; t <= 12000; t += 50)
+    m.update(t, 50, 120, 700.0f, 540.0f, 600.0f, true);
+  CHECK(m.pwm < 255);
+  CHECK_EQ(m.fault, MotorControl::NONE);
 }
 
 // ---------------------------------------------------------------------------
@@ -1724,7 +1829,7 @@ static void testSelfMac() {
 }
 
 static void testUnmeasuredPulsesPerRev() {
-  std::printf("NOTE: PULSES_PER_REV=144.0 未实机标定；590/600 目前只是软件命令值。\n");
+  std::printf("NOTE: PULSES_PER_REV=144.0 未实机标定；540 / OS600(历史,未启用) 目前只是软件命令值。\n");
 }
 
 int main() {
@@ -1774,7 +1879,11 @@ int main() {
   testH_NormalCongestion();
   testI_SecondBindBlocked();
   testStateEventOnce();
+  testPiFractionAccumulates();
+  testPiFractionZeroErrorStable();
+  testPiFractionUnloading();
   testMotorTarget();
+  testLowSpeedThresholdFollowsTarget();
   testNoOverspeedLatchAtAnyRpm();
   testRecoversAfterHighRpm();
   testNoPulsesStillLatches();

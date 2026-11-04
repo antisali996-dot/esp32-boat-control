@@ -13,8 +13,8 @@
 // servo_pulse.h / steering.h / motor_control.h 以 static_assert 把本文件的数值钉死，
 // 任何一边改数值而另一边没改，编译阶段就会失败。
 
-#define FW_SCHEMA 11
-#define FW_VER "20261103-590rpm-r11"
+#define FW_SCHEMA 13
+#define FW_VER "20261104-540rpm-r13"
 
 // 转向：中位 90°，逻辑范围 70～110°（左右各 20°）。
 #define FW_STEER_DEG 20
@@ -29,14 +29,15 @@
 #define FW_MIN_US 1278
 #define FW_MAX_US 1722
 
-// 调速：固定 590 RPM 目标。
-// 本版【已取消】600 RPM 超速锁存停机：转速高于目标时由 PI 正常降低输出。
+// 调速：目标 540 RPM（r12 临时降低：现场反馈按未标定 PPR 折算实际约 586 转，
+// 该数值只是比例估算；540 不代表完成测速标定）。
+// 600 RPM 超速锁存保持关闭：转速高于目标时由 PI 正常降低输出。
 // 取消锁停不代表保证空载转速低于 600；没有电流反馈，也不能保证带载不过载。
 // FW_OVERSPEED_RPM 仅作为历史数值保留，不参与任何停机判断。
-#define FW_TARGET_RPM 590
+#define FW_TARGET_RPM 540
 #define FW_OVERSPEED_RPM 600
-// 控制修订号：r11 = 取消 600 超速锁存（OSOFF）。
-#define FW_CONTROL_REV "r11-osoff"
+// 控制修订号：r13 = PI 小数积分保留（仅真实饱和/斜率约束时反压积分）。
+#define FW_CONTROL_REV "r13-pi-fraction"
 
 // 遥控器摇杆死区（沿用原程序数值，等待实测再定）。
 #define FW_JOY_DEAD_LOW 1750

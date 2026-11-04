@@ -91,7 +91,8 @@ TaskHandle_t displayTaskHandle = nullptr;
 bool displayEnabled = false;
 
 // 显示任务写入的错误码，主循环只读取用于打印一次。
-volatile int displayErrorCode = 0;      // 0 无 / 1 初始化失败 / 2 发送失败
+// 0 无 / 1 屏幕初始化失败 / 2 总线或发送失败 / 3 I2C 总线初始化失败
+volatile int displayErrorCode = 0;
 volatile bool displayErrorReported = false;
 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, 27, 26);
@@ -142,6 +143,28 @@ bool checkResult(const char *step, esp_err_t result) {
 }
 
 // ---- 显示任务：Wire / U8g2 只在这里访问 --------------------------------
+// ---- 显示任务内部使用的总线状态（只被 displayTask 访问） ----------------
+// r12 修复：原实现里 setup() 不再调用 Wire.begin()，显示任务第一次
+// displayResponds() 时总线未初始化，探测必然失败，随后又跳过 initDisplay，
+// 形成永久黑屏路径。现在总线初始化移入显示任务，且必须先成功才允许探测。
+enum DisplayBusState { DISPLAY_BUS_UNINIT = 0, DISPLAY_BUS_READY = 1, DISPLAY_BUS_FAILED = 2 };
+DisplayBusState displayBus = DISPLAY_BUS_UNINIT;
+uint32_t displayBusNextTryMs = 0;      // 总线失败后的下一次重试时刻（至少间隔 1 秒）
+
+// 只在显示任务里调用。成功返回 true；失败置 displayBus=FAILED 并报告错误码 3。
+bool displayBusInit() {
+  // SDA=26 / SCL=27、100kHz、20ms 超时（与本文件原有约定一致）。
+  if (!Wire.begin(26, 27, 100000)) {
+    displayBus = DISPLAY_BUS_FAILED;
+    displayErrorCode = 3;              // 经控制循环报告一次；控制不受影响
+    return false;
+  }
+  Wire.setTimeOut(20);
+  u8g2.setBusClock(100000);
+  displayBus = DISPLAY_BUS_READY;
+  return true;
+}
+
 bool displayResponds(uint8_t address) {
   Wire.beginTransmission(address);
   return Wire.endTransmission() == 0;
@@ -155,9 +178,24 @@ void displayTask(void *) {
     if (xQueueReceive(displayQueue, &snap, pdMS_TO_TICKS(DISPLAY_PERIOD_MS)) != pdTRUE) continue;
 
     const uint32_t now = millis();
+
+    // 总线未初始化或此前失败：到点重试，成功之前绝不探测、绝不刷新。
+    if (displayBus != DISPLAY_BUS_READY) {
+      if (displayBus == DISPLAY_BUS_UNINIT ||
+          int32_t(now - displayBusNextTryMs) >= 0) {
+        if (!displayBusInit()) {
+          // 下次至少隔 1 秒；不用忙循环。
+          displayBusNextTryMs = now + 1000;
+          continue;
+        }
+      } else {
+        continue;                      // 等待重试间隔，不做任何探测
+      }
+    }
+
     const bool wasOnline = displayOnline;
 
-    // 掉线探测与恢复全部在显示任务内完成。
+    // 掉线探测与恢复全部在显示任务内完成（0x3C / 0x3D）。
     if (!displayOnline || !displayResponds(displayAddress)) {
       displayOnline = false;
       for (uint8_t address : {uint8_t(0x3C), uint8_t(0x3D)}) {
@@ -165,12 +203,16 @@ void displayTask(void *) {
       }
     }
     if (!displayOnline) {
-      if (wasOnline) displayErrorCode = 2;   // 由控制循环报告一次；本任务不直接打印
+      // 首次上电找不到屏幕也要报告，不能只在“在线变离线”时报。
+      if (wasOnline || !displayErrorReported) displayErrorCode = 2;
       continue;
     }
 
     if (!wasOnline || uint32_t(now - lastInit) >= DISPLAY_REINIT_PERIOD_MS) {
       u8g2.setI2CAddress(displayAddress << 1);
+      // U8g2 内部的 BYTE_INIT 会再次 Wire.begin(26,27)；ESP32 的 TwoWire
+      // 在总线已初始化时直接返回成功且不覆盖引脚（Wire.cpp 的 i2cIsInit 早退），
+      // 因此这里之后的 SDA/SCL 仍是 26/27、100kHz。
       u8g2.initDisplay();
       u8g2.setPowerSave(0);
       u8g2.setFont(u8g2_font_6x12_tr);
@@ -433,7 +475,11 @@ void loop() {
   }
   if (displayErrorCode != 0 && !displayErrorReported) {
     displayErrorReported = true;
-    runLog.logLine("EVENT DISPLAY_ERROR=%d (control continues)", (int)displayErrorCode);
+    if (displayErrorCode == 3) {
+      runLog.logLine("EVENT DISPLAY_BUS_INIT_FAILED (control continues, retry every 1s)");
+    } else {
+      runLog.logLine("EVENT DISPLAY_ERROR=%d (control continues)", (int)displayErrorCode);
+    }
   }
 
   // ---- 周期报告：每秒一次；零等待投递 ----

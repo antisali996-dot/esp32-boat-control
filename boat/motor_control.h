@@ -52,15 +52,37 @@ struct MotorControl {
     }
     const float error = targetRpm - rpm;
     const float proportional = 0.18f * error;
-    integral = clamp(integral + 0.8f * error * (elapsed / 1000.0f), 0, 255);
-    const int desired = (int)clamp(proportional + integral + 0.001f, 0, 255);
-    const int applied = desired > pwm + 10 ? pwm + 10 : desired;
+
+    // r13 修复：整数 PWM 取整会吞掉小数积分，小幅持续掉速时输出永远不涨。
+    // 现在区分“真实输出限制”与“普通取整”：
+    //   - 未受真实约束时保留候选积分（含小数），留到下一周期；
+    //   - 确实受上限/斜率约束时，才按实际下发 PWM 反压积分。
+    const int oldPwm = pwm;                                    // 1. 本周期计算前的旧 PWM
+    const float candidateIntegral =                            // 2. 候选积分（原系数、真实 elapsed）
+        clamp(integral + 0.8f * error * (elapsed / 1000.0f), 0, 255);
+    const float rawOutput = proportional + candidateIntegral;  // 3. 未限幅的浮点输出
+
+    // 4. desired/applied 规则保持不变。
+    const int desired = (int)clamp(rawOutput + 0.001f, 0, 255);
+    const int applied = desired > oldPwm + 10 ? oldPwm + 10 : desired;
     pwm = applied;
-    // 抗积分饱和：积分跟随“真正下发的输出”，而不是理想输出。
-    // 输出被启动斜率或上限约束时，不再继续积累推动加速的积分。
+
+    // 5/6/7. 抗积分饱和只对真实约束生效。
     if (proportional >= 0) {
-      const float room = (float)pwm - proportional;
-      integral = room > 0 ? (integral > room ? room : integral) : 0;
+      const bool saturatedHigh = rawOutput > 255.0f;       // 真实上限约束
+      const bool slopeLimited  = desired > oldPwm + 10;    // 真实上升斜率约束
+      if (saturatedHigh || slopeLimited) {
+        // 按实际下发的 PWM 反压积分，不得越过约束继续积累。
+        const float room = (float)pwm - proportional;
+        integral = room > 0 ? (candidateIntegral > room ? room : candidateIntegral) : 0;
+      } else {
+        integral = candidateIntegral;                      // 普通取整不吞积分
+      }
+      if (integral < 0) integral = 0;
+      if (integral > 255) integral = 255;
+    } else {
+      // 8. 负误差方向保持原有处理（候选积分本身已被 clamp 到 0..255）。
+      integral = candidateIntegral;
     }
   }
 };
