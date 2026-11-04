@@ -7,7 +7,7 @@
 //   boat/identity_line.h   身份行格式化（固件 postIdentity 与测试共用同一实现）
 //   boat/self_mac_logic.h  自身 MAC 判定
 //   boat/speed_window.h    测速窗口与临界区交换
-//   boat/motor_control.h   590 目标 / 600 超速锁存
+//   boat/motor_control.h   540 目标(r12) / 600 锁存已取消(OSOFF)
 //   boat/servo_pulse.h     舵机脉宽与 14 位量化
 //   remote/tx_callback.h   发送回调适配层
 //   remote/tx_state.h      发送状态机
@@ -68,7 +68,7 @@ constexpr float PULSES_PER_REV = 144.0f;
 // 身份常量
 // ---------------------------------------------------------------------------
 static void testIdentity() {
-  CHECK_EQ(FW_TARGET_RPM, 590);
+  CHECK_EQ(FW_TARGET_RPM, 540);   // r12：目标临时降为 540
   CHECK_EQ(FW_OVERSPEED_RPM, 600);
   CHECK_EQ(FW_CENTER_ANGLE, 90);
   CHECK_EQ(FW_MIN_ANGLE, 70);
@@ -77,17 +77,18 @@ static void testIdentity() {
   CHECK_EQ(FW_MIN_US, 1278);
   CHECK_EQ(FW_MAX_US, 1722);
   CHECK(FW_OVERSPEED_RPM > FW_TARGET_RPM);
-  CHECK(std::strstr(FW_ID_BOAT, "R590") != nullptr);
+  CHECK(std::strstr(FW_ID_BOAT, "R540") != nullptr);
+  CHECK(std::strstr(FW_ID_BOAT, "R590") == nullptr);
   CHECK(std::strstr(FW_ID_BOAT, "OSOFF") != nullptr);
   CHECK(std::strstr(FW_ID_BOAT, "OS600") == nullptr);
   CHECK(std::strstr(FW_ID_BOAT, "S20-A70-110-U1278-1500-1722") != nullptr);
   CHECK(std::strstr(FW_ID_BOAT, "R580") == nullptr);
   // r10 发布身份必须与上一版不同。
-  CHECK_EQ(FW_SCHEMA, 11);
-  CHECK(std::strstr(FW_VER, "r11") != nullptr);
-  CHECK(std::strstr(FW_ID_BOAT, "r11") != nullptr);
-  CHECK(std::strstr(FW_ID_BOAT, "r10") == nullptr);
-  CHECK(std::strstr(FW_ID_REMOTE, "r10") == nullptr);
+  CHECK_EQ(FW_SCHEMA, 12);
+  CHECK(std::strstr(FW_VER, "r12") != nullptr);
+  CHECK(std::strstr(FW_ID_BOAT, "r12") != nullptr);
+  CHECK(std::strstr(FW_ID_BOAT, "r11") == nullptr);
+  CHECK(std::strstr(FW_ID_REMOTE, "r11") == nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -698,11 +699,11 @@ static void testFaultEvidenceNoneAndThreeFaults() {
   {
     FaultEvidence ev;
     MotorControl m;
-    // 先建立非零输出。
+    // 先建立非零输出（激励须低于目标 540，否则稳态输出会收敛到 0）。
     for (uint32_t t = 50; t <= 2000; t += 50) {
-      const MeasureRecord cur = ev.beginWindow(t, 585, m.pwm, 70, 50, m.integral);
+      const MeasureRecord cur = ev.beginWindow(t, 400, m.pwm, 70, 50, m.integral);
       const MotorControl::Fault before = m.fault;
-      m.update(t, 50, 70, 585, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
+      m.update(t, 50, 70, 400, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
       ev.afterUpdate(before, m.fault, cur);
     }
     CHECK(!ev.latched);
@@ -1471,12 +1472,30 @@ static void runMotor(MotorControl &m, uint32_t fromMs, uint32_t toMs, uint32_t s
 }
 
 static void testMotorTarget() {
+  // r12：420 低于目标 540，但高于严重低速阈值 351（540*0.65），可用于验证正常调节。
   MotorControl m;
   runMotor(m, 50, 4000, 50, 60, 420);
   CHECK_EQ(m.fault, MotorControl::NONE);
   CHECK_EQ(m.pwm, 255);
   m.update(4050, 50, 120, 1000, (float)FW_TARGET_RPM, (float)FW_OVERSPEED_RPM, true);
   CHECK(m.pwm < 255);
+}
+
+// r12：低速保护阈值必须跟随新目标 540（540*0.65=351），不得写死旧 590 对应的 383.5。
+// 360 高于新阈值 351、低于旧目标 590 对应的 383.5；且只有在 PWM>=220 并持续 2000ms
+// 的条件同时满足时才会锁存严重低速——阈值不同时本测试的结局必然不同。
+static void testLowSpeedThresholdFollowsTarget() {
+  // rpm=360：高于新阈值 351 → 不判低速；低于旧阈值 383.5 → 写死旧值时会被判低速。
+  MotorControl a;
+  runMotor(a, 50, 3000, 50, 60, 360);
+  CHECK_EQ(a.fault, MotorControl::NONE);      // 360 高于 351，不锁存
+  CHECK(a.pwm > 0);
+
+  // rpm=340：低于 351，且 PWM>=220 持续 2000ms → 必须锁存 LOW_SPEED。
+  MotorControl b;
+  runMotor(b, 50, 10000, 50, 60, 340);
+  CHECK_EQ(b.fault, MotorControl::LOW_SPEED);
+  CHECK_EQ(b.pwm, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1724,7 +1743,7 @@ static void testSelfMac() {
 }
 
 static void testUnmeasuredPulsesPerRev() {
-  std::printf("NOTE: PULSES_PER_REV=144.0 未实机标定；590/600 目前只是软件命令值。\n");
+  std::printf("NOTE: PULSES_PER_REV=144.0 未实机标定；540 / OS600(历史,未启用) 目前只是软件命令值。\n");
 }
 
 int main() {
@@ -1775,6 +1794,7 @@ int main() {
   testI_SecondBindBlocked();
   testStateEventOnce();
   testMotorTarget();
+  testLowSpeedThresholdFollowsTarget();
   testNoOverspeedLatchAtAnyRpm();
   testRecoversAfterHighRpm();
   testNoPulsesStillLatches();
